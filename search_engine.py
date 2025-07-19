@@ -717,7 +717,7 @@ def main():
 
         logger.info("Starting search API server...")
         api = SearchAPI(search_engine)
-        api.run(host="0.0.0.0", port=5000, debug=True)
+        api.run(host="0.0.0.0", port=5000, debug=False)
 
     except Exception as e:
         logger.error(f"Application error: {e}")
