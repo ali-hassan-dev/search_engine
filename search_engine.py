@@ -488,13 +488,17 @@ class SearchEngine:
                     "intitule": {"pre_tags": ["<mark>"], "post_tags": ["</mark>"]},
                     "description": {"pre_tags": ["<mark>"], "post_tags": ["</mark>"]},
                 }
-            },
-            "size": size,
-            "from": from_,
+            }
         }
 
         try:
-            response = self.es.search(index=self.INDEX_NAME, body=search_body, from_=from_, size=size)
+            response = self.es.search(
+                index=self.INDEX_NAME,
+                query=search_body["query"],
+                highlight=search_body["highlight"],
+                size=size,
+                from_=from_
+            )
             return response
         except Exception as e:
             logger.error(f"Search error: {e}")
