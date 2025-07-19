@@ -1,17 +1,20 @@
 import os
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Iterator
+from dotenv import load_dotenv
 from dataclasses import dataclass, asdict
 from contextlib import contextmanager
 import time
 
 import mysql.connector
 from elasticsearch import Elasticsearch
-from elasticsearch.helpers import bulk
+from elasticsearch.helpers import bulk, streaming_bulk
 from flask import Flask, request, jsonify, render_template_string
 from flask_cors import CORS
 import unicodedata
 import re
+
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -42,14 +45,27 @@ class DatabaseManager:
             "charset": "utf8mb4",
             "collation": "utf8mb4_unicode_ci",
             "autocommit": True,
+            "connection_timeout": 300,
+            "sql_mode": "",
+            "use_unicode": True,
+            "buffered": False,
         }
 
     @contextmanager
     def get_connection(self):
-        """Context manager for database connections"""
+        """Context manager for database connections with optimized settings"""
         conn = None
         try:
             conn = mysql.connector.connect(**self.config)
+
+            cursor = conn.cursor()
+            cursor.execute("SET SESSION net_read_timeout = 600")
+            cursor.execute("SET SESSION net_write_timeout = 600")
+            cursor.execute("SET SESSION wait_timeout = 28800")
+            cursor.execute("SET SESSION interactive_timeout = 28800")
+            cursor.execute("SET SESSION max_execution_time = 0")
+            cursor.close()
+
             yield conn
         except mysql.connector.Error as e:
             logger.error(f"Database error: {e}")
@@ -58,55 +74,130 @@ class DatabaseManager:
             if conn and conn.is_connected():
                 conn.close()
 
-    def fetch_all_jobs(self, batch_size: int = 1000):
-        """Yield JobOffer in batches by paginating on the primary key."""
-        last_id = 0
-        query = """
-            SELECT id, intitule, description
-            FROM PE_offres
-            WHERE id > %s
-                AND intitule IS NOT NULL
-                AND description IS NOT NULL
-            ORDER BY id
-            LIMIT %s
+    def fetch_jobs_iterator(self, batch_size: int = 10000) -> Iterator[List[JobOffer]]:
         """
+        Fetch job offers in batches using LIMIT/OFFSET to avoid memory issues
+        Returns an iterator of job batches
+        """
+        offset = 0
+        total_processed = 0
+
         with self.get_connection() as conn:
-            cursor = conn.cursor(dictionary=True)
+            count_cursor = conn.cursor()
+            count_cursor.execute(
+                """
+                SELECT COUNT(*) as total 
+                FROM PE_offres 
+                WHERE intitule IS NOT NULL 
+                AND description IS NOT NULL
+                AND TRIM(intitule) != ''
+                AND TRIM(description) != ''
+            """
+            )
+            total_count = count_cursor.fetchone()[0]
+            count_cursor.close()
+            logger.info(f"Total jobs to process: {total_count:,}")
+
             while True:
-                cursor.execute(query, (last_id, batch_size))
-                rows = cursor.fetchall()
-                if not rows:
-                    break
-                for row in rows:
-                    yield JobOffer(
-                        id=row["id"],
-                        intitule=row["intitule"] or "",
-                        description=row["description"] or "",
+                cursor = conn.cursor(dictionary=True, buffered=False)
+
+                query = """
+                    SELECT id, intitule, description 
+                    FROM PE_offres 
+                    WHERE intitule IS NOT NULL 
+                    AND description IS NOT NULL
+                    AND TRIM(intitule) != ''
+                    AND TRIM(description) != ''
+                    ORDER BY id
+                    LIMIT %s OFFSET %s
+                """
+
+                logger.info(
+                    f"Fetching batch: offset={offset:,}, batch_size={batch_size:,}"
+                )
+                start_time = time.time()
+
+                try:
+                    cursor.execute(query, (batch_size, offset))
+
+                    batch = []
+                    row_count = 0
+
+                    for row in cursor:
+                        batch.append(
+                            JobOffer(
+                                id=row["id"],
+                                intitule=(
+                                    row["intitule"].strip() if row["intitule"] else ""
+                                ),
+                                description=(
+                                    row["description"].strip()
+                                    if row["description"]
+                                    else ""
+                                ),
+                            )
+                        )
+                        row_count += 1
+
+                    cursor.close()
+
+                    if not batch:
+                        logger.info(f"Finished processing all {total_processed:,} jobs")
+                        break
+
+                    fetch_time = time.time() - start_time
+                    total_processed += len(batch)
+                    progress = (
+                        (total_processed / total_count) * 100 if total_count > 0 else 0
                     )
-                last_id = rows[-1]["id"]
+
+                    logger.info(
+                        f"Fetched {len(batch):,} jobs in {fetch_time:.2f}s | "
+                        f"Progress: {progress:.1f}% ({total_processed:,}/{total_count:,})"
+                    )
+
+                    yield batch
+                    offset += batch_size
+
+                    time.sleep(0.1)
+
+                except mysql.connector.Error as e:
+                    logger.error(f"Error fetching batch at offset {offset}: {e}")
+                    cursor.close()
+                    raise
+
+    def fetch_all_jobs(self) -> List[JobOffer]:
+        """
+        Legacy method for backward compatibility - now uses batching internally
+        Warning: This loads all jobs into memory at once, use fetch_jobs_iterator for large datasets
+        """
+        logger.warning(
+            "fetch_all_jobs loads all data into memory. Consider using fetch_jobs_iterator for better performance."
+        )
+
+        all_jobs = []
+        for batch in self.fetch_jobs_iterator(batch_size=5000):
+            all_jobs.extend(batch)
+
+        return all_jobs
+
+    def get_job_count(self) -> int:
+        """Get the total count of valid job offers"""
+        with self.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT COUNT(*) as total 
+                FROM PE_offres 
+                WHERE intitule IS NOT NULL 
+                AND description IS NOT NULL
+                AND TRIM(intitule) != ''
+                AND TRIM(description) != ''
+            """
+            )
+            count = cursor.fetchone()[0]
             cursor.close()
-
-    # def fetch_all_jobs(self) -> List[JobOffer]:
-    #     """Fetch all job offers from MySQL"""
-    #     with self.get_connection() as conn:
-    #         cursor = conn.cursor(dictionary=True)
-    #         cursor.execute("""
-    #             SELECT id, intitule, description
-    #             FROM PE_offres
-    #             WHERE intitule IS NOT NULL
-    #             AND description IS NOT NULL
-    #         """)
-
-    #         jobs = []
-    #         for row in cursor.fetchall():
-    #             jobs.append(JobOffer(
-    #                 id=row['id'],
-    #                 intitule=row['intitule'] or '',
-    #                 description=row['description'] or ''
-    #             ))
-
-    #         cursor.close()
-    #         return jobs
+            return count
 
 
 class SearchEngine:
@@ -190,6 +281,8 @@ class SearchEngine:
                 },
                 "number_of_shards": 1,
                 "number_of_replicas": 0,
+                "refresh_interval": "30s",
+                "max_result_window": 100000,
             },
             "mappings": {
                 "properties": {
@@ -223,8 +316,69 @@ class SearchEngine:
         self.es.indices.create(index=self.INDEX_NAME, body=index_config)
         logger.info(f"Created index: {self.INDEX_NAME}")
 
+    def index_jobs_streaming(self, db_manager: DatabaseManager):
+        """
+        Index job offers using streaming bulk indexing for memory efficiency
+        """
+
+        def doc_generator():
+            batch_count = 0
+            for batch in db_manager.fetch_jobs_iterator(batch_size=5000):
+                batch_count += 1
+                logger.info(
+                    f"Processing batch {batch_count} for Elasticsearch indexing..."
+                )
+
+                for job in batch:
+                    combined_text = f"{job.intitule} {job.description}"
+
+                    yield {
+                        "_index": self.INDEX_NAME,
+                        "_id": job.id,
+                        "_source": {
+                            "id": job.id,
+                            "intitule": job.intitule,
+                            "description": job.description,
+                            "combined_text": combined_text,
+                        },
+                    }
+
+        success_count = 0
+        error_count = 0
+
+        for ok, result in streaming_bulk(
+            self.es,
+            doc_generator(),
+            chunk_size=1000,
+            max_chunk_bytes=10485760,
+            request_timeout=60,
+        ):
+            if ok:
+                success_count += 1
+            else:
+                error_count += 1
+                logger.error(f"Indexing error: {result}")
+
+            if (success_count + error_count) % 10000 == 0:
+                logger.info(
+                    f"Indexed {success_count:,} documents, {error_count:,} errors"
+                )
+
+        self.es.indices.refresh(index=self.INDEX_NAME)
+        logger.info(
+            f"Streaming indexing completed: {success_count:,} successful, {error_count:,} errors"
+        )
+
+        return success_count, error_count
+
     def index_jobs(self, jobs: List[JobOffer]):
-        """Index job offers in Elasticsearch"""
+        """
+        Legacy batch indexing method - kept for backward compatibility
+        Use index_jobs_streaming for large datasets
+        """
+        logger.warning(
+            "index_jobs loads all jobs into memory. Use index_jobs_streaming for better performance."
+        )
 
         def doc_generator():
             for job in jobs:
@@ -244,6 +398,7 @@ class SearchEngine:
 
         success, failed = bulk(self.es, doc_generator(), chunk_size=1000)
         logger.info(f"Indexed {success} documents, {len(failed)} failed")
+        return success, len(failed)
 
     def search(self, query: str, size: int = 50, from_: int = 0) -> Dict[str, Any]:
         """Search for job offers"""
@@ -515,14 +670,14 @@ def main():
         db_manager = DatabaseManager(DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD)
         search_engine = SearchEngine(ES_HOST, ES_PORT)
 
-        logger.info("Loading job offers from MySQL...")
-        # jobs = db_manager.fetch_all_jobs()
-        jobs_gen = db_manager.fetch_all_jobs(batch_size=1000)
-        # logger.info(f"Loaded {len(jobs)} job offers")
+        job_count = db_manager.get_job_count()
+        logger.info(f"Total valid jobs in database: {job_count:,}")
 
-        logger.info("Indexing jobs in Elasticsearch...")
-        search_engine.index_jobs(jobs_gen)
-        # search_engine.index_jobs(jobs)
+        logger.info("Starting streaming indexing of jobs...")
+        success_count, error_count = search_engine.index_jobs_streaming(db_manager)
+        logger.info(
+            f"Indexing completed: {success_count:,} successful, {error_count:,} errors"
+        )
 
         logger.info("Starting search API server...")
         api = SearchAPI(search_engine)
