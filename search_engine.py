@@ -494,7 +494,7 @@ class SearchEngine:
         }
 
         try:
-            response = self.es.search(index=self.INDEX_NAME, **search_body)
+            response = self.es.search(index=self.INDEX_NAME, body=search_body, from_=from_, size=size)
             return response
         except Exception as e:
             logger.error(f"Search error: {e}")
