@@ -1,6 +1,6 @@
 import os
 import logging
-from typing import List, Dict, Any, Iterator
+from typing import List, Dict, Any, Optional, Iterator
 from dotenv import load_dotenv
 from dataclasses import dataclass, asdict
 from contextlib import contextmanager
@@ -74,18 +74,23 @@ class DatabaseManager:
             if conn and conn.is_connected():
                 conn.close()
 
-    def fetch_jobs_iterator(self, batch_size: int = 10000) -> Iterator[List[JobOffer]]:
+    def fetch_jobs_iterator(
+        self, batch_size: int = 10000, max_records: Optional[int] = None
+    ) -> Iterator[List[JobOffer]]:
         """
         Fetch job offers in batches using LIMIT/OFFSET to avoid memory issues
         Returns an iterator of job batches
+
+        Args:
+            batch_size: Number of records per batch
+            max_records: Maximum total records to fetch (None for all records)
         """
         offset = 0
         total_processed = 0
 
         with self.get_connection() as conn:
             count_cursor = conn.cursor()
-            count_cursor.execute(
-                """
+            base_query = """
                 SELECT COUNT(*) as total 
                 FROM PE_offres 
                 WHERE intitule IS NOT NULL 
@@ -93,13 +98,28 @@ class DatabaseManager:
                 AND TRIM(intitule) != ''
                 AND TRIM(description) != ''
             """
-            )
-            total_count = count_cursor.fetchone()[0]
+
+            if max_records:
+                count_cursor.execute(f"{base_query} LIMIT %s", (max_records,))
+                total_count = min(count_cursor.fetchone()[0], max_records)
+            else:
+                count_cursor.execute(base_query)
+                total_count = count_cursor.fetchone()[0]
+
             count_cursor.close()
             logger.info(f"Total jobs to process: {total_count:,}")
 
             while True:
+                if max_records and total_processed >= max_records:
+                    logger.info(f"Reached max_records limit: {max_records:,}")
+                    break
+
                 cursor = conn.cursor(dictionary=True, buffered=False)
+
+                current_batch_size = batch_size
+                if max_records:
+                    remaining = max_records - total_processed
+                    current_batch_size = min(batch_size, remaining)
 
                 query = """
                     SELECT id, intitule, description 
@@ -113,12 +133,12 @@ class DatabaseManager:
                 """
 
                 logger.info(
-                    f"Fetching batch: offset={offset:,}, batch_size={batch_size:,}"
+                    f"Fetching batch: offset={offset:,}, batch_size={current_batch_size:,}"
                 )
                 start_time = time.time()
 
                 try:
-                    cursor.execute(query, (batch_size, offset))
+                    cursor.execute(query, (current_batch_size, offset))
 
                     batch = []
                     row_count = 0
@@ -157,7 +177,7 @@ class DatabaseManager:
                     )
 
                     yield batch
-                    offset += batch_size
+                    offset += current_batch_size
 
                     time.sleep(0.1)
 
@@ -313,17 +333,25 @@ class SearchEngine:
             },
         }
 
-        self.es.indices.create(index=self.INDEX_NAME, body=index_config)
+        self.es.indices.create(index=self.INDEX_NAME, **index_config)
         logger.info(f"Created index: {self.INDEX_NAME}")
 
-    def index_jobs_streaming(self, db_manager: DatabaseManager):
+    def index_jobs_streaming(
+        self, db_manager: DatabaseManager, max_records: Optional[int] = None
+    ):
         """
         Index job offers using streaming bulk indexing for memory efficiency
+
+        Args:
+            db_manager: Database manager instance
+            max_records: Maximum number of records to index (None for all)
         """
 
         def doc_generator():
             batch_count = 0
-            for batch in db_manager.fetch_jobs_iterator(batch_size=5000):
+            for batch in db_manager.fetch_jobs_iterator(
+                batch_size=5000, max_records=max_records
+            ):
                 batch_count += 1
                 logger.info(
                     f"Processing batch {batch_count} for Elasticsearch indexing..."
@@ -466,7 +494,7 @@ class SearchEngine:
         }
 
         try:
-            response = self.es.search(index=self.INDEX_NAME, body=search_body)
+            response = self.es.search(index=self.INDEX_NAME, **search_body)
             return response
         except Exception as e:
             logger.error(f"Search error: {e}")
@@ -505,7 +533,7 @@ class SearchAPI:
         @self.app.route("/search", methods=["GET"])
         def search():
             query = request.args.get("q", "").strip()
-            size = min(int(request.args.get("size", 50)), 100)
+            size = min(int(request.args.get("size", 50)), 100)  # Max 100 results
             from_ = int(request.args.get("from", 0))
 
             if not query:
@@ -673,8 +701,16 @@ def main():
         job_count = db_manager.get_job_count()
         logger.info(f"Total valid jobs in database: {job_count:,}")
 
+        # For testing, limit to a manageable number
+        MAX_RECORDS_FOR_TESTING = int(
+            os.getenv("MAX_RECORDS", 50000)
+        )  # Default 50k for testing
+        logger.info(f"Processing max {MAX_RECORDS_FOR_TESTING:,} records for testing")
+
         logger.info("Starting streaming indexing of jobs...")
-        success_count, error_count = search_engine.index_jobs_streaming(db_manager)
+        success_count, error_count = search_engine.index_jobs_streaming(
+            db_manager, MAX_RECORDS_FOR_TESTING
+        )
         logger.info(
             f"Indexing completed: {success_count:,} successful, {error_count:,} errors"
         )
